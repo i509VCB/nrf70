@@ -1,9 +1,6 @@
 #![no_std]
 #![no_main]
-#![feature(type_alias_impl_trait)]
 #![deny(unused_must_use)]
-#![feature(async_fn_in_trait)]
-#![feature(impl_trait_projections)]
 
 use defmt::*;
 use defmt_rtt as _; // global logger
