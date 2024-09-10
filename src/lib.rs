@@ -1,7 +1,5 @@
 #![no_std]
 #![deny(unused_must_use)]
-#![feature(async_fn_in_trait)]
-#![feature(impl_trait_projections)]
 
 use core::mem::{align_of, size_of, size_of_val, zeroed};
 use core::slice;
@@ -462,7 +460,8 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
     }
 
     async fn rpu_irq_watchdog_ack(&mut self) {
-        self.write32(c::RPU_REG_MIPS_MCU_TIMER_CONTROL, None, 0).await;
+        // TODO: This went away?
+        // self.write32(c::RPU_REG_MIPS_MCU_TIMER_CONTROL, None, 0).await;
     }
 
     async fn rpu_event_read(&mut self, event_address: u32, buf: &mut [u32]) {
@@ -640,24 +639,10 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
             mgmt_buff_offload: 0,
             op_band: 0,
             tcp_ip_checksum_offload: 0,
-            tx_pwr_ctrl_params: c::tx_pwr_ctrl_params {
-                ant_gain_2g: 0,
-                ant_gain_5g_band1: 0,
-                ant_gain_5g_band2: 0,
-                ant_gain_5g_band3: 0,
-                band_edge_2g_lo: 0,
-                band_edge_2g_hi: 0,
-                band_edge_5g_unii_1_lo: 0,
-                band_edge_5g_unii_1_hi: 0,
-                band_edge_5g_unii_2a_lo: 0,
-                band_edge_5g_unii_2a_hi: 0,
-                band_edge_5g_unii_2c_lo: 0,
-                band_edge_5g_unii_2c_hi: 0,
-                band_edge_5g_unii_3_lo: 0,
-                band_edge_5g_unii_3_hi: 0,
-                band_edge_5g_unii_4_lo: 0,
-                band_edge_5g_unii_4_hi: 0,
-            },
+            feature_flags: c::feature_flags::FEAT_SYSTEM_MODE as _,
+            disable_beamforming: 1,
+            discon_timeout: 0,
+            ps_data_retrieval_mech: c::data_retrieve_mechanism::PS_POLL_FRAME as u8,
         };
         self.send_cmd(cmd).await;
     }
