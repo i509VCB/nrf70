@@ -7,7 +7,9 @@
 use defmt::*;
 use defmt_rtt as _; // global logger
 use embassy_executor::Spawner;
-use embassy_nrf::{bind_interrupts, gpio::{AnyPin, Input, Level, Output, OutputDrive, Pin, Pull}, spim::{self, Spim}};
+use embassy_nrf::bind_interrupts;
+use embassy_nrf::gpio::{AnyPin, Input, Level, Output, OutputDrive, Pin, Pull};
+use embassy_nrf::spim::{self, Spim};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use nrf70::SpiBus;

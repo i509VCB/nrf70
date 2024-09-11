@@ -1,18 +1,22 @@
 #![no_std]
 #![deny(unused_must_use)]
 
-use core::mem::{align_of, size_of, size_of_val, zeroed};
+mod c_defmt;
+mod fw;
+
+use core::mem::{self, align_of, offset_of, size_of, size_of_val, zeroed};
 use core::slice;
 
 use align_data::{include_aligned, Align16};
-use defmt::{assert, panic, todo, unwrap, *};
+use defmt::{assert, debug_assert_eq, panic, todo, unwrap, *};
 use embassy_net_driver_channel as ch;
 use embassy_net_driver_channel::driver::LinkState;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, WithTimeout};
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::Operation;
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::spi::SpiDevice;
+use fw::FirmwareInfo;
 use regions::*;
 
 #[allow(unused)]
@@ -215,10 +219,12 @@ pub(crate) enum Processor {
     UMAC,
 }
 
-static FW_LMAC_PATCH_PRI: &[u8] = include_aligned!(Align16, "../fw/lmac_patch_pri_bimg.bin");
-static FW_LMAC_PATCH_SEC: &[u8] = include_aligned!(Align16, "../fw/lmac_patch_sec_bin.bin");
-static FW_UMAC_PATCH_PRI: &[u8] = include_aligned!(Align16, "../fw/umac_patch_pri_bimg.bin");
-static FW_UMAC_PATCH_SEC: &[u8] = include_aligned!(Align16, "../fw/umac_patch_sec_bin.bin");
+// static FW_LMAC_PATCH_PRI: &[u8] = include_aligned!(Align16, "../fw/lmac_patch_pri_bimg.bin");
+// static FW_LMAC_PATCH_SEC: &[u8] = include_aligned!(Align16, "../fw/lmac_patch_sec_bin.bin");
+// static FW_UMAC_PATCH_PRI: &[u8] = include_aligned!(Align16, "../fw/umac_patch_pri_bimg.bin");
+// static FW_UMAC_PATCH_SEC: &[u8] = include_aligned!(Align16, "../fw/umac_patch_sec_bin.bin");
+
+static FW: &[u8] = include_aligned!(Align16, "../fw/nrf70.bin");
 
 const SR0_WRITE_IN_PROGRESS: u8 = 0x01;
 
@@ -317,56 +323,141 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
         // Now enable the relevant MCU interrupt line
         self.raw_write32(SYSBUS, 0x494, 1 << 31).await;
 
-        info!("load LMAC firmware patches...");
-        self.raw_write32(SYSBUS, 0x000, 0x01).await; // reset
-        while self.raw_read32(SYSBUS, 0x0000).await & 0x01 != 0 {}
-        while self.raw_read32(SYSBUS, 0x0018).await & 0x01 != 1 {}
-        self.load_fw(LMAC_RET_RAM, 0x9000, FW_LMAC_PATCH_PRI).await;
-        self.load_fw(LMAC_RET_RAM, 0x4000, FW_LMAC_PATCH_SEC).await;
+        let fw_info = fw::FirmwareInfo::read(FW);
+        info!("FW info:");
 
-        self.raw_write32(GRAM, 0xD50, 0).await;
-        self.raw_write32(SYSBUS, 0x50, 0x3c1a8000).await;
-        self.raw_write32(SYSBUS, 0x54, 0x275a0000).await;
-        self.raw_write32(SYSBUS, 0x58, 0x03400008).await;
-        self.raw_write32(SYSBUS, 0x5c, 0x00000000).await;
-        self.raw_write32(SYSBUS, 0x2C2c, 0x9000).await;
+        info!("features: {}", fw_info.features as u32);
 
-        info!("booting LMAC...");
-        self.raw_write32(SYSBUS, 0x000, 0x01).await; // reset
-        while self.raw_read32(GRAM, 0xD50).await != 0x5A5A5A5A {}
+        for image in fw_info.images.iter() {
+            if let Some(image) = image {
+                info!("- Image ty: {}", image.ty as u32);
+                info!("- Image data len: {}", image.data.len());
+            }
+        }
 
-        info!("load UMAC firmware patches...");
-        self.raw_write32(SYSBUS, 0x100, 0x01).await; // reset
-        while self.raw_read32(SYSBUS, 0x0100).await & 0x01 != 0 {}
-        while self.raw_read32(SYSBUS, 0x0118).await & 0x01 != 1 {}
-        self.load_fw(UMAC_RET_RAM, 0x14400, FW_UMAC_PATCH_PRI).await;
-        self.load_fw(UMAC_RET_RAM, 0xC000, FW_UMAC_PATCH_SEC).await;
+        // UMAC First???
+        self.load_patches(&fw_info).await;
 
-        self.raw_write32(PKTRAM, 0, 0).await;
-        self.raw_write32(SYSBUS, 0x150, 0x3c1a8000).await;
-        self.raw_write32(SYSBUS, 0x154, 0x275a0000).await;
-        self.raw_write32(SYSBUS, 0x158, 0x03400008).await;
-        self.raw_write32(SYSBUS, 0x15c, 0x00000000).await;
-        self.raw_write32(SYSBUS, 0x2C30, 0x14400).await;
+        self.boot_lmac(&fw_info).await;
+        self.boot_umac(&fw_info).await;
 
-        info!("booting UMAC...");
-        self.raw_write32(SYSBUS, 0x100, 0x01).await; // reset
-        while self.raw_read32(PKTRAM, 0).await != 0x5A5A5A5A {}
+        let lmac_version = self.read32(c::RPU_MEM_LMAC_VER, Some(Processor::LMAC)).await;
+        let (version, major, minor, extra) = unpack_version(lmac_version);
+        defmt::info!("LMAC version: {}.{}.{}.{}", version, major, minor, extra);
+
+        let umac_version = self.read32(c::RPU_MEM_UMAC_VER, Some(Processor::UMAC)).await;
+        let (version, major, minor, extra) = unpack_version(umac_version);
+        defmt::info!("UMAC version: {}.{}.{}.{}", version, major, minor, extra);
+
+        // TODO: nrf_wifi_fmac_dev_init_rt
 
         info!("Initializing rpu info...");
         self.init_rpu_info().await;
 
-        info!("Enabling interrupts...");
-        self.rpu_irq_enable().await;
-
+        // TODO: OTP info?
+        // TODO: RF params
+        // TODO: init tx
         info!("Initializing TX...");
         self.init_tx().await;
 
+        // TODO: init rx
         info!("Initializing RX...");
         self.init_rx().await;
 
         info!("Initializing umac...");
         self.init_umac().await;
+
+        info!("Enabling interrupts...");
+        self.rpu_irq_enable().await;
+
+        // TODO: umac_cmd_init
+        // TODO: wait for fw init done event
+
+        // For later: setup the interface type
+    }
+
+    async fn load_patches(&mut self, fw: &FirmwareInfo<'_>) {
+        info!("load UMAC firmware patches...");
+        self.load_fw(UMAC_RET_RAM, c::UMAC_ROM_PATCH_OFFSET, fw.get(c::image_ids::IMAGE_UMAC_PRI))
+            .await;
+        self.load_fw(UMAC_RET_RAM, c::RPU_MEM_UMAC_PATCH_BIN - UMAC_RET_RAM.rpu_mem_start, fw.get(c::image_ids::IMAGE_UMAC_SEC))
+            .await;
+
+        info!("load LMAC firmware patches...");
+        self.load_fw(LMAC_RET_RAM, c::LMAC_ROM_PATCH_OFFSET, fw.get(c::image_ids::IMAGE_LMAC_PRI))
+            .await;
+        self.load_fw(LMAC_RET_RAM, c::RPU_MEM_LMAC_PATCH_BIN - LMAC_RET_RAM.rpu_mem_start, fw.get(c::image_ids::IMAGE_LMAC_SEC))
+            .await;
+    }
+
+    async fn boot_lmac(&mut self, fw: &FirmwareInfo<'_>) {
+        info!("booting LMAC");
+        // Write firmware signature
+        self.write32(c::RPU_MEM_LMAC_BOOT_SIG, Some(Processor::LMAC), fw.signature).await;
+
+        // Write to sleep control register
+        self.write32(c::RPU_REG_UCC_SLEEP_CTRL_DATA_0, Some(Processor::LMAC), c::LMAC_ROM_PATCH_OFFSET).await;
+
+        // Write boot vector to RPU
+        self.write32(c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_0, Some(Processor::LMAC), c::LMAC_BOOT_EXCP_VECT_0).await;
+        self.write32(c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_1, Some(Processor::LMAC), c::LMAC_BOOT_EXCP_VECT_1).await;
+        self.write32(c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_2, Some(Processor::LMAC), c::LMAC_BOOT_EXCP_VECT_2).await;
+        self.write32(c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_3, Some(Processor::LMAC), c::LMAC_BOOT_EXCP_VECT_3).await;
+
+        // Reset the LMAC
+        self.write32(c::RPU_REG_MIPS_MCU_CONTROL, Some(Processor::LMAC), 0x01).await;
+    
+        // Wait for the LMAC to boot
+        let mut i = 20;
+
+        loop {
+            // TODO: Nordic's headers are wrong - LMAC produces 0x5a5a5a5a, not 0xb7000d50 as expected by c::RPU_MEM_LMAC_BOOT_SIG 
+            if self.read32(c::RPU_MEM_LMAC_BOOT_SIG, None).await == 0x5A5A5A5A {
+                break
+            }
+
+            Timer::after_millis(2).await;
+            i -= 1;
+
+            if i == 0 {
+                panic!("LMAC failed to boot after 40ms");
+            }
+        }
+    }
+
+    async fn boot_umac(&mut self, fw: &FirmwareInfo<'_>) {
+        info!("booting UMAC");
+        // Write firmware signature
+        self.write32(c::RPU_MEM_UMAC_BOOT_SIG, Some(Processor::UMAC), fw.signature).await;
+
+        // Write to sleep control register
+        self.write32(c::RPU_REG_UCC_SLEEP_CTRL_DATA_1, Some(Processor::UMAC), c::UMAC_ROM_PATCH_OFFSET).await;
+
+        // Write boot vector to RPU
+        self.write32(c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_0, Some(Processor::UMAC), c::UMAC_BOOT_EXCP_VECT_0).await;
+        self.write32(c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_1, Some(Processor::UMAC), c::UMAC_BOOT_EXCP_VECT_1).await;
+        self.write32(c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_2, Some(Processor::UMAC), c::UMAC_BOOT_EXCP_VECT_2).await;
+        self.write32(c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_3, Some(Processor::UMAC), c::UMAC_BOOT_EXCP_VECT_3).await;
+
+        // Reset the LMAC
+        self.write32(c::RPU_REG_MIPS_MCU2_CONTROL, Some(Processor::UMAC), 0x01).await;
+    
+        // Wait for the LMAC to boot
+        let mut i = 20;
+
+        loop {
+            // TODO: Nordic's headers are wrong - LMAC produces 0x5a5a5a5a, not 0xb7000d50 as expected by c::RPU_MEM_LMAC_BOOT_SIG 
+            if self.read32(c::RPU_MEM_UMAC_BOOT_SIG, None).await == 0x5A5A5A5A {
+                break
+            }
+
+            Timer::after_millis(2).await;
+            i -= 1;
+
+            if i == 0 {
+                panic!("UMAC failed to boot after 40ms");
+            }
+        }
     }
 
     pub async fn run(&mut self) -> ! {
@@ -376,6 +467,7 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
 
         loop {
             self.host_irq.wait_for_high().await.unwrap();
+            info!("Host IRQ");
 
             let mut event_count = 0;
 
@@ -460,8 +552,8 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
     }
 
     async fn rpu_irq_watchdog_ack(&mut self) {
-        // TODO: This went away?
-        // self.write32(c::RPU_REG_MIPS_MCU_TIMER_CONTROL, None, 0).await;
+        info!("ACKing watchdog");
+        self.write32(c::RPU_REG_MIPS_MCU_UCCP_INT_CLEAR, None, 1 << c::RPU_REG_BIT_MIPS_WATCHDOG_INT_CLEAR).await;
     }
 
     async fn rpu_event_read(&mut self, event_address: u32, buf: &mut [u32]) {
@@ -521,11 +613,11 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
         }
     }
 
-    async fn rpu_hpq_enqueue(&mut self, hpq: HostRpuHPQ, value: u32) {
+    async fn rpu_hpq_enqueue(&mut self, hpq: c::host_rpu_hpq, value: u32) {
         self.write32(hpq.enqueue_addr, None, value).await;
     }
 
-    async fn rpu_hpq_dequeue(&mut self, hpq: HostRpuHPQ) -> Option<u32> {
+    async fn rpu_hpq_dequeue(&mut self, hpq: c::host_rpu_hpq) -> Option<u32> {
         let value = self.read32(hpq.dequeue_addr, None).await;
 
         // Pop element only if it is valid
@@ -539,14 +631,13 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
 
     async fn init_rpu_info(&mut self) {
         // Based on 'wifi_nrf_hal_dev_init'
-
-        let mut hpqm_info = [0; size_of::<HostRpuHPQMInfo>()];
+        let mut hpqm_info = [0; size_of::<c::host_rpu_hpqm_info>()];
         self.read(c::RPU_MEM_HPQ_INFO, None, slice32_mut(&mut hpqm_info)).await;
 
         let rx_cmd_base = self.read32(c::RPU_MEM_RX_CMD_BASE, None).await;
 
         self.rpu_info = Some(RpuInfo {
-            hpqm_info: unsafe { core::mem::transmute_copy(&hpqm_info) },
+            hpqm_info: unsafe { mem::transmute_copy(&hpqm_info) },
             rx_cmd_base,
             tx_cmd_base: c::RPU_MEM_TX_CMD_BASE,
         });
@@ -576,13 +667,10 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
         let cmd_bytes = sliceit(&cmd);
         buf8[..cmd_bytes.len()].copy_from_slice(cmd_bytes);
 
-        unwrap!(
-            embassy_time::with_timeout(
-                Duration::from_secs(1),
-                self.rpu_cmd_ctrl_send(slice8(&buf[..(size_of::<T>() + 3) / 4]))
-            )
+        self.rpu_cmd_ctrl_send(slice8(&buf[..(size_of::<T>() + 3) / 4]))
+            .with_timeout(Duration::from_secs(1))
             .await
-        );
+            .expect("timed out")
     }
 
     async fn init_umac(&mut self) {
@@ -917,6 +1005,15 @@ impl<T: SpiDevice> Bus for SpiBus<T> {
     }
 }
 
+fn unpack_version(version: u32) -> (u32, u32, u32, u32) {
+    let v = (version & 0xFF00_0000) >> 24;
+    let major = (version & 0x00FF_0000) >> 16;
+    let minor = (version & 0x0000_FF00) >> 16;
+    let extra = version & 0x0000_00FF;
+
+    (v, major, minor, extra)
+}
+
 /*
 pub struct QspiBus<'a> {
     qspi: Qspi<'a, QSPI>,
@@ -991,7 +1088,7 @@ pub(crate) struct HostRpuHPQMInfo {
 
 #[derive(Debug, defmt::Format)]
 pub(crate) struct RpuInfo {
-    hpqm_info: HostRpuHPQMInfo,
+    hpqm_info: c::host_rpu_hpqm_info,
     /// The base address for posting RX commands.
     rx_cmd_base: u32,
     /// The base address for posting TX commands.

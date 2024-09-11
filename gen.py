@@ -6,7 +6,7 @@ import shutil
 import subprocess
 
 def confirm():
-    text = input("This script is going to clone the updated Nordic repositories (at least a few hundred MB). Enter 'y' to proceed: ")
+    text = input("This script is going to clone the updated Nordic repositories and fetch new firmware blobs. Enter 'y' to proceed: ")
 
     if text.lower() != 'y':
         exit(1)
@@ -35,6 +35,11 @@ def clone_headers():
 
     try:
         shutil.rmtree("./target/hal_nordic")
+    except:
+        pass
+
+    try:
+        os.mkdir("./target")
     except:
         pass
 
@@ -118,15 +123,12 @@ def bindgen_fw_if():
         check = True
     )
 
-# check_git()
-# confirm()
-# clone_headers()
-# commit = get_firmware_commit()
-# clone_firmware(commit)
+check_git()
+confirm()
+clone_headers()
+commit = get_firmware_commit()
+clone_firmware(commit)
 bindgen_fw_if()
-
-# # for f in glob.glob("fw/*.bin"):
-# #     os.remove(f)
 
 h = open("fw/bindings.rs").read()
 h = re.sub("= (\d+);", lambda m: "= 0x{:x};".format(int(m[1])), h)
@@ -146,6 +148,21 @@ subprocess.run(
     ],
     check=True,
 )
+
+for f in glob.glob("fw/*.bin"):
+    os.remove(f)
+
+shutil.copyfile(
+    "./target/nrfxlib/nrf_wifi/fw_bins/default/nrf70.bin",
+    "./fw/nrf70.bin",
+)
+
+shutil.copyfile(
+    "./target/nrfxlib/nrf_wifi/fw_bins/radio_test/nrf70.bin",
+    "./fw/nrf70_radiotest.bin",
+)
+
+# TODO: Clone firmware
 
 # h = open(
 #     "fw/fw_if/umac_if/inc/fw/rpu_fw_patches.h"
