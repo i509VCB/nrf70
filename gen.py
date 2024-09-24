@@ -108,6 +108,7 @@ def clone_firmware(commit: str):
 def bindgen_fw_if():
     subprocess.run(
         [
+            # Need at least 0.70
             "bindgen",
             "gen_wrapper.h",
             "--output=fw/bindings.rs",
@@ -116,6 +117,7 @@ def bindgen_fw_if():
             "--default-enum-style=rust",
             "--no-prepend-enum-name",
             "--no-layout-tests",
+            "--flexarray-dst",
             "--",
             "-I./target/hal_nordic/drivers/nrf_wifi/fw_if/umac_if/inc/fw/",
             "-I./target/hal_nordic/drivers/nrf_wifi/hw_if/hal/inc/fw/",
@@ -138,6 +140,8 @@ h = h.replace("NRF_WIFI_", "")
 h = h.replace("nrf_wifi_", "")
 h = h.replace("nrf70_", "")
 h = h.replace("NRF70_", "")
+# https://github.com/rust-lang/rust-bindgen/issues/2936
+h = h.replace(": FAM,", ": ::core::mem::ManuallyDrop<FAM>,")
 open("fw/bindings.rs", "w").write(h)
 
 subprocess.run(

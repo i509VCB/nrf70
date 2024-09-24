@@ -4,11 +4,13 @@
 mod c_defmt;
 mod fw;
 
-use core::mem::{self, align_of, offset_of, size_of, size_of_val, zeroed};
-use core::slice;
+use core::cell::{Cell, RefCell};
+use core::marker::PhantomData;
+use core::mem::{self, align_of, offset_of, size_of, size_of_val, zeroed, ManuallyDrop, MaybeUninit};
+use core::{ptr, slice};
 
 use align_data::{include_aligned, Align16};
-use defmt::{assert, debug_assert_eq, panic, todo, unwrap, *};
+use defmt::{assert, assert_eq, debug_assert_eq, panic, todo, unwrap, *};
 use embassy_net_driver_channel as ch;
 use embassy_net_driver_channel::driver::LinkState;
 use embassy_time::{Duration, Timer, WithTimeout};
@@ -30,7 +32,23 @@ mod c {
 
 const MTU: usize = 1514;
 
-struct Shared {}
+#[derive(Clone, Copy)]
+enum StateInner {
+    Done,
+
+    Pending { message: DynMessage },
+
+    Sent(*mut [u8]),
+}
+
+struct Shared {
+    state: Cell<StateInner>,
+    wakers: RefCell<Wakers>,
+    /// Whether a scan is in progress.
+    scanning: Cell<bool>,
+}
+
+struct Wakers {}
 
 pub struct State {
     shared: Shared,
@@ -41,7 +59,11 @@ impl State {
     pub fn new() -> Self {
         Self {
             ch: ch::State::new(),
-            shared: Shared {},
+            shared: Shared {
+                state: Cell::new(StateInner::Done),
+                wakers: RefCell::new(Wakers {}),
+                scanning: Cell::new(false)
+            },
         }
     }
 }
@@ -89,8 +111,48 @@ pub struct Control<'a> {
     state_ch: ch::StateRunner<'a>,
 }
 
+impl<'a> Control<'a> {
+    pub fn scan<const N: usize>(&mut self, frequencies: [u32; N]) -> Scanner<'a, N> {
+        assert!(
+            N < c::SCAN_MAX_NUM_FREQUENCIES as usize,
+            "Exceeded maximum amount of frequencies to scan: {}",
+            c::SCAN_MAX_NUM_FREQUENCIES
+        );
+
+        let scan_params = c::scan_params {
+            passive_scan: 0x1,
+            num_scan_ssids: todo!(),
+            scan_ssids: todo!(),
+            no_cck: todo!(),
+            bands: todo!(),
+            ie: todo!(),
+            mac_addr: todo!(),
+            dwell_time_active: todo!(),
+            dwell_time_passive: todo!(),
+            num_scan_channels: todo!(),
+            skip_local_admin_macs: todo!(),
+            center_frequency: ManuallyDrop::new(frequencies),
+        };
+
+        let info = c::umac_scan_info {
+            scan_reason: c::scan_reason::SCAN_DISPLAY as _,
+            scan_params: todo!(),
+        };
+
+        let cmd_scan = c::umac_cmd_scan {
+            umac_hdr: unsafe { zeroed() },
+            info,
+        };
+    }
+}
+
+pub struct Scanner<'a, const N: usize> {
+    shared: &'a Shared,
+}
+
 trait Command {
     const MESSAGE_TYPE: c::host_rpu_msg_type;
+
     fn fill(&mut self);
 }
 
@@ -105,6 +167,8 @@ macro_rules! impl_cmd {
                 };
             }
         }
+
+        impl_cmd!(@common, $cmd);
     };
     (umac, $cmd:path, $num:expr) => {
         impl Command for $cmd {
@@ -116,7 +180,45 @@ macro_rules! impl_cmd {
                 };
             }
         }
+
+        impl_cmd!(@common, $cmd);
     };
+
+    (@common, $cmd: path) => {
+        impl $cmd {
+            pub const SIZE: usize = mem::size_of::<Self>();
+
+            #[allow(unused)]
+            pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+                unsafe { core::ptr::read(core::mem::transmute(self)) }
+            }
+
+            #[allow(unused)]
+            pub fn from_bytes(bytes: &[u8; Self::SIZE]) -> &Self {
+                let alignment = core::mem::align_of::<Self>();
+                assert_eq!(
+                    bytes.as_ptr().align_offset(alignment),
+                    0,
+                    "{} is not aligned",
+                    core::any::type_name::<Self>()
+                );
+                unsafe { core::mem::transmute(bytes) }
+            }
+
+            #[allow(unused)]
+            pub fn from_bytes_mut(bytes: &mut [u8; Self::SIZE]) -> &mut Self {
+                let alignment = core::mem::align_of::<Self>();
+                assert_eq!(
+                    bytes.as_ptr().align_offset(alignment),
+                    0,
+                    "{} is not aligned",
+                    core::any::type_name::<Self>()
+                );
+
+                unsafe { core::mem::transmute(bytes) }
+            }
+        }
+    }
 }
 
 impl_cmd!(sys, c::cmd_sys_init, c::sys_commands::CMD_INIT);
@@ -126,6 +228,14 @@ impl_cmd!(
     c::umac_commands::UMAC_CMD_CHANGE_MACADDR
 );
 impl_cmd!(umac, c::umac_cmd_chg_vif_state, c::umac_commands::UMAC_CMD_SET_IFFLAGS);
+
+impl_cmd!(umac, c::umac_cmd_scan, c::umac_commands::UMAC_CMD_TRIGGER_SCAN);
+impl_cmd!(umac, c::umac_cmd_abort_scan, c::umac_commands::UMAC_CMD_ABORT_SCAN);
+impl_cmd!(
+    umac,
+    c::umac_cmd_get_scan_results,
+    c::umac_commands::UMAC_CMD_GET_SCAN_RESULTS
+);
 
 fn sliceit<T>(t: &T) -> &[u8] {
     unsafe { slice::from_raw_parts(t as *const _ as _, size_of::<T>()) }
@@ -218,11 +328,6 @@ pub(crate) enum Processor {
     LMAC,
     UMAC,
 }
-
-// static FW_LMAC_PATCH_PRI: &[u8] = include_aligned!(Align16, "../fw/lmac_patch_pri_bimg.bin");
-// static FW_LMAC_PATCH_SEC: &[u8] = include_aligned!(Align16, "../fw/lmac_patch_sec_bin.bin");
-// static FW_UMAC_PATCH_PRI: &[u8] = include_aligned!(Align16, "../fw/umac_patch_pri_bimg.bin");
-// static FW_UMAC_PATCH_SEC: &[u8] = include_aligned!(Align16, "../fw/umac_patch_sec_bin.bin");
 
 static FW: &[u8] = include_aligned!(Align16, "../fw/nrf70.bin");
 
@@ -378,42 +483,85 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
 
     async fn load_patches(&mut self, fw: &FirmwareInfo<'_>) {
         info!("load UMAC firmware patches...");
-        self.load_fw(UMAC_RET_RAM, c::UMAC_ROM_PATCH_OFFSET, fw.get(c::image_ids::IMAGE_UMAC_PRI))
-            .await;
-        self.load_fw(UMAC_RET_RAM, c::RPU_MEM_UMAC_PATCH_BIN - UMAC_RET_RAM.rpu_mem_start, fw.get(c::image_ids::IMAGE_UMAC_SEC))
-            .await;
+        self.load_fw(
+            UMAC_RET_RAM,
+            c::UMAC_ROM_PATCH_OFFSET,
+            fw.get(c::image_ids::IMAGE_UMAC_PRI),
+        )
+        .await;
+        self.load_fw(
+            UMAC_RET_RAM,
+            c::RPU_MEM_UMAC_PATCH_BIN - UMAC_RET_RAM.rpu_mem_start,
+            fw.get(c::image_ids::IMAGE_UMAC_SEC),
+        )
+        .await;
 
         info!("load LMAC firmware patches...");
-        self.load_fw(LMAC_RET_RAM, c::LMAC_ROM_PATCH_OFFSET, fw.get(c::image_ids::IMAGE_LMAC_PRI))
-            .await;
-        self.load_fw(LMAC_RET_RAM, c::RPU_MEM_LMAC_PATCH_BIN - LMAC_RET_RAM.rpu_mem_start, fw.get(c::image_ids::IMAGE_LMAC_SEC))
-            .await;
+        self.load_fw(
+            LMAC_RET_RAM,
+            c::LMAC_ROM_PATCH_OFFSET,
+            fw.get(c::image_ids::IMAGE_LMAC_PRI),
+        )
+        .await;
+        self.load_fw(
+            LMAC_RET_RAM,
+            c::RPU_MEM_LMAC_PATCH_BIN - LMAC_RET_RAM.rpu_mem_start,
+            fw.get(c::image_ids::IMAGE_LMAC_SEC),
+        )
+        .await;
     }
 
     async fn boot_lmac(&mut self, fw: &FirmwareInfo<'_>) {
         info!("booting LMAC");
         // Write firmware signature
-        self.write32(c::RPU_MEM_LMAC_BOOT_SIG, Some(Processor::LMAC), fw.signature).await;
+        self.write32(c::RPU_MEM_LMAC_BOOT_SIG, Some(Processor::LMAC), fw.signature)
+            .await;
 
         // Write to sleep control register
-        self.write32(c::RPU_REG_UCC_SLEEP_CTRL_DATA_0, Some(Processor::LMAC), c::LMAC_ROM_PATCH_OFFSET).await;
+        self.write32(
+            c::RPU_REG_UCC_SLEEP_CTRL_DATA_0,
+            Some(Processor::LMAC),
+            c::LMAC_ROM_PATCH_OFFSET,
+        )
+        .await;
 
         // Write boot vector to RPU
-        self.write32(c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_0, Some(Processor::LMAC), c::LMAC_BOOT_EXCP_VECT_0).await;
-        self.write32(c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_1, Some(Processor::LMAC), c::LMAC_BOOT_EXCP_VECT_1).await;
-        self.write32(c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_2, Some(Processor::LMAC), c::LMAC_BOOT_EXCP_VECT_2).await;
-        self.write32(c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_3, Some(Processor::LMAC), c::LMAC_BOOT_EXCP_VECT_3).await;
+        self.write32(
+            c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_0,
+            Some(Processor::LMAC),
+            c::LMAC_BOOT_EXCP_VECT_0,
+        )
+        .await;
+        self.write32(
+            c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_1,
+            Some(Processor::LMAC),
+            c::LMAC_BOOT_EXCP_VECT_1,
+        )
+        .await;
+        self.write32(
+            c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_2,
+            Some(Processor::LMAC),
+            c::LMAC_BOOT_EXCP_VECT_2,
+        )
+        .await;
+        self.write32(
+            c::RPU_REG_MIPS_MCU_BOOT_EXCP_INSTR_3,
+            Some(Processor::LMAC),
+            c::LMAC_BOOT_EXCP_VECT_3,
+        )
+        .await;
 
         // Reset the LMAC
-        self.write32(c::RPU_REG_MIPS_MCU_CONTROL, Some(Processor::LMAC), 0x01).await;
-    
+        self.write32(c::RPU_REG_MIPS_MCU_CONTROL, Some(Processor::LMAC), 0x01)
+            .await;
+
         // Wait for the LMAC to boot
         let mut i = 20;
 
         loop {
-            // TODO: Nordic's headers are wrong - LMAC produces 0x5a5a5a5a, not 0xb7000d50 as expected by c::RPU_MEM_LMAC_BOOT_SIG 
+            // TODO: Nordic's headers are wrong - LMAC produces 0x5a5a5a5a, not 0xb7000d50 as expected by c::RPU_MEM_LMAC_BOOT_SIG
             if self.read32(c::RPU_MEM_LMAC_BOOT_SIG, None).await == 0x5A5A5A5A {
-                break
+                break;
             }
 
             Timer::after_millis(2).await;
@@ -428,27 +576,54 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
     async fn boot_umac(&mut self, fw: &FirmwareInfo<'_>) {
         info!("booting UMAC");
         // Write firmware signature
-        self.write32(c::RPU_MEM_UMAC_BOOT_SIG, Some(Processor::UMAC), fw.signature).await;
+        self.write32(c::RPU_MEM_UMAC_BOOT_SIG, Some(Processor::UMAC), fw.signature)
+            .await;
 
         // Write to sleep control register
-        self.write32(c::RPU_REG_UCC_SLEEP_CTRL_DATA_1, Some(Processor::UMAC), c::UMAC_ROM_PATCH_OFFSET).await;
+        self.write32(
+            c::RPU_REG_UCC_SLEEP_CTRL_DATA_1,
+            Some(Processor::UMAC),
+            c::UMAC_ROM_PATCH_OFFSET,
+        )
+        .await;
 
         // Write boot vector to RPU
-        self.write32(c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_0, Some(Processor::UMAC), c::UMAC_BOOT_EXCP_VECT_0).await;
-        self.write32(c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_1, Some(Processor::UMAC), c::UMAC_BOOT_EXCP_VECT_1).await;
-        self.write32(c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_2, Some(Processor::UMAC), c::UMAC_BOOT_EXCP_VECT_2).await;
-        self.write32(c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_3, Some(Processor::UMAC), c::UMAC_BOOT_EXCP_VECT_3).await;
+        self.write32(
+            c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_0,
+            Some(Processor::UMAC),
+            c::UMAC_BOOT_EXCP_VECT_0,
+        )
+        .await;
+        self.write32(
+            c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_1,
+            Some(Processor::UMAC),
+            c::UMAC_BOOT_EXCP_VECT_1,
+        )
+        .await;
+        self.write32(
+            c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_2,
+            Some(Processor::UMAC),
+            c::UMAC_BOOT_EXCP_VECT_2,
+        )
+        .await;
+        self.write32(
+            c::RPU_REG_MIPS_MCU2_BOOT_EXCP_INSTR_3,
+            Some(Processor::UMAC),
+            c::UMAC_BOOT_EXCP_VECT_3,
+        )
+        .await;
 
         // Reset the LMAC
-        self.write32(c::RPU_REG_MIPS_MCU2_CONTROL, Some(Processor::UMAC), 0x01).await;
-    
+        self.write32(c::RPU_REG_MIPS_MCU2_CONTROL, Some(Processor::UMAC), 0x01)
+            .await;
+
         // Wait for the LMAC to boot
         let mut i = 20;
 
         loop {
-            // TODO: Nordic's headers are wrong - LMAC produces 0x5a5a5a5a, not 0xb7000d50 as expected by c::RPU_MEM_LMAC_BOOT_SIG 
+            // TODO: Nordic's headers are wrong - LMAC produces 0x5a5a5a5a, not 0xb7000d50 as expected by c::RPU_MEM_LMAC_BOOT_SIG
             if self.read32(c::RPU_MEM_UMAC_BOOT_SIG, None).await == 0x5A5A5A5A {
-                break
+                break;
             }
 
             Timer::after_millis(2).await;
@@ -553,7 +728,12 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
 
     async fn rpu_irq_watchdog_ack(&mut self) {
         info!("ACKing watchdog");
-        self.write32(c::RPU_REG_MIPS_MCU_UCCP_INT_CLEAR, None, 1 << c::RPU_REG_BIT_MIPS_WATCHDOG_INT_CLEAR).await;
+        self.write32(
+            c::RPU_REG_MIPS_MCU_UCCP_INT_CLEAR,
+            None,
+            1 << c::RPU_REG_BIT_MIPS_WATCHDOG_INT_CLEAR,
+        )
+        .await;
     }
 
     async fn rpu_event_read(&mut self, event_address: u32, buf: &mut [u32]) {
@@ -646,6 +826,7 @@ impl<'a, BUS: Bus, IN: InputPin + Wait, OUT: OutputPin> Runner<'a, BUS, IN, OUT>
     async fn send_cmd<T: Command>(&mut self, mut cmd: T) {
         cmd.fill();
 
+        // FIXME: The guess is wrong, a scan command with 64 frequencies to scan for is 3022 bytes.
         const MAX_CMD_SIZE: usize = 512; // TODO this is a wild guess.
 
         let mut buf = [0u32; MAX_CMD_SIZE / 4];
@@ -1098,4 +1279,93 @@ pub(crate) struct RpuInfo {
 struct RxPoolMapInfo {
     pool_id: u32,
     buf_id: u32,
+}
+
+#[repr(C, packed)]
+union MessageInner<Command, Reply> {
+    // These fields are fake "Copy"
+    command: ManuallyDrop<Command>,
+    reply: ManuallyDrop<Reply>,
+}
+
+struct Message<Command, Reply> {
+    inner: c::host_rpu_msg<MessageInner<Command, Reply>>,
+    cmd_len: usize,
+    reply_len: usize,
+}
+
+impl<Command: crate::Command, Reply> Message<Command, Reply> {
+    pub fn new(command: Command) -> Self {
+        let cmd_len = mem::size_of::<c::host_rpu_msg>() + mem::size_of::<Command>();
+        let reply_len = mem::size_of::<c::host_rpu_msg>() + mem::size_of::<Reply>();
+        
+        Self {
+            inner: c::host_rpu_msg {
+                hdr: c::host_rpu_msg_hdr {
+                    len: cmd_len as u32,
+                    // TODO: Don't know
+                    resubmit: 0,
+                },
+                type_: Command::MESSAGE_TYPE as _,
+                msg: ManuallyDrop::new(MessageInner {
+                    command: ManuallyDrop::new(command),
+                }),
+            },
+            cmd_len,
+            reply_len,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The lifetime of the return value shall not exceed the lifetime of this message.
+    pub unsafe fn downgrade(&mut self) -> DynMessage {
+        DynMessage {
+            ptr: ptr::from_mut(&mut self.inner).cast(),
+            cmd_len: self.cmd_len,
+            reply_len: self.reply_len,
+        }
+    }
+}
+
+/// A type erased [`Message`]. (Might need to remove the lifetime for sending to the runner, thereby making access unsafe)
+#[derive(Clone, Copy)]
+struct DynMessage {
+    ptr: *mut c::host_rpu_msg,
+    cmd_len: usize,
+    reply_len: usize,
+}
+
+impl DynMessage {
+    pub fn ty(&self) -> c::host_rpu_msg_type {
+        let msg = unsafe { self.ptr.read_unaligned() };
+        unsafe { mem::transmute(msg.type_) }
+    }
+
+    /// Get the content of this message as a slice for sending to the device.
+    ///
+    /// # Safety
+    ///
+    /// - The memory referenced by the returned slice must not be mutated for the duration of lifetime 'a.
+    ///   'a must also be shorter than the lifetime of the message.
+    /// - The returned slice is only valid before accessing the reply slice.
+    pub unsafe fn as_cmd_slice<'a>(&self) -> &'a [u8] {
+        // SAFETY: TODO
+        let slice = unsafe { slice::from_raw_parts(self.ptr.cast::<u8>(), self.cmd_len) };
+        slice
+    }
+
+    /// Get the content of this message as a slice for sending to the device.
+    ///
+    /// # Safety
+    ///
+    /// - The memory referenced by the returned slice must not be accessed through
+    ///   any other pointer (not derived from the return value) for the duration of
+    ///   lifetime 'a. Both read and write accesses are forbidden. 'a must also be shorter
+    ///   than the lifetime of the message.
+    /// - Writing to this slice invalidates the command view of the slice.
+    pub unsafe fn as_reply_slice<'a>(&mut self) -> &'a mut [u8] {
+        let slice = unsafe { slice::from_raw_parts_mut(self.ptr.cast::<u8>(), self.reply_len) };
+        slice
+    }
 }

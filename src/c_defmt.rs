@@ -2,8 +2,9 @@
 
 use core::ptr::addr_of;
 
-use crate::c;
 use defmt::{write, *};
+
+use crate::c;
 
 impl defmt::Format for c::host_rpu_hpqm_info {
     fn format(&self, fmt: Formatter) {
@@ -27,8 +28,7 @@ impl defmt::Format for c::host_rpu_hpq {
         write!(
             fmt,
             "host_rpu_hpq {{ enqueue_addr: {}, dequeue_addr: {} }}",
-            enqueue_addr,
-            dequeue_addr,
+            enqueue_addr, dequeue_addr,
         )
     }
 }

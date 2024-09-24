@@ -132,7 +132,6 @@ impl<'a> Cursor<'a> {
 pub struct fw_image_verify {
     pub type_: ::core::ffi::c_uint,
     pub len: ::core::ffi::c_uint,
-    pub data: c::__IncompleteArrayField<::core::ffi::c_uchar>,
 }
 
 #[allow(non_camel_case_types)]
@@ -144,7 +143,6 @@ pub struct fw_image_info_verify {
     pub feature_flags: ::core::ffi::c_uint,
     pub len: ::core::ffi::c_uint,
     pub hash: [::core::ffi::c_uchar; 32usize],
-    pub data: c::__IncompleteArrayField<::core::ffi::c_uchar>,
 }
 
 #[cfg(test)]
